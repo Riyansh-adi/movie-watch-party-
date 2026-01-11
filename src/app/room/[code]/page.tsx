@@ -82,9 +82,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     try {
       try {
         video.currentTime = time;
-      } catch {
-        // ignore
-      }
+      } catch {}
 
       if (action === "play") {
         await safePlay(video);
@@ -113,9 +111,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       if (diff > 0.5) {
         try {
           video.currentTime = currentTime;
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
 
       if (isPlaying) {
@@ -224,9 +220,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                     await navigator.clipboard.writeText(code);
                     setCopied(true);
                     setTimeout(() => setCopied(false), 1200);
-                  } catch {
-                    // ignore
-                  }
+                  } catch {}
                 }}
               >
                 {copied ? "Copied" : "Copy code"}
@@ -242,15 +236,12 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
           {(error || closed) && (
             <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-700">
-              {closed
-                ? "Room closed (host disconnected)."
-                : `Error: ${error ?? "Unknown error"}`}
+              {closed ? "Room closed (host disconnected)." : `Error: ${error ?? "Unknown error"}`}
             </div>
           )}
 
           <div className="grid gap-4 lg:grid-cols-[2fr_1fr]">
             <div className="rounded-2xl border border-zinc-200 bg-black/95">
-              {/* ✅ FIXED VIDEO PLAYER */}
               <video
                 ref={videoRef}
                 className="aspect-video w-full rounded-2xl"
@@ -268,52 +259,34 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                   const video = videoRef.current;
                   if (!video) return;
 
-                  // ✅ Guest can see controls, but cannot control.
-                  // If guest tries to play, revert.
+                  // guest pressed play => revert
                   if (!canControl) {
                     if (!applyingRemoteRef.current) video.pause();
                     return;
                   }
 
                   if (applyingRemoteRef.current) return;
-                  socket.emit("sync:action", {
-                    code,
-                    action: "play",
-                    time: video.currentTime,
-                  });
+                  socket.emit("sync:action", { code, action: "play", time: video.currentTime });
                 }}
                 onPause={() => {
                   const video = videoRef.current;
                   if (!video) return;
 
-                  // ✅ Guest tries pause => revert back to play (if host is playing, status sync fixes it)
-                  if (!canControl) {
-                    if (!applyingRemoteRef.current) void safePlay(video);
-                    return;
-                  }
+                  // guest pressed pause => ignore (host status will resync)
+                  if (!canControl) return;
 
                   if (applyingRemoteRef.current) return;
-                  socket.emit("sync:action", {
-                    code,
-                    action: "pause",
-                    time: video.currentTime,
-                  });
+                  socket.emit("sync:action", { code, action: "pause", time: video.currentTime });
                 }}
                 onSeeked={() => {
                   const video = videoRef.current;
                   if (!video) return;
 
-                  // ✅ Guest tries seeking => ignore; next host status will correct drift
-                  if (!canControl) {
-                    return;
-                  }
+                  // guest tried seek => ignore
+                  if (!canControl) return;
 
                   if (applyingRemoteRef.current) return;
-                  socket.emit("sync:action", {
-                    code,
-                    action: "seek",
-                    time: video.currentTime,
-                  });
+                  socket.emit("sync:action", { code, action: "seek", time: video.currentTime });
                 }}
               />
             </div>
@@ -354,7 +327,6 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                       }
                     }
 
-                    // Best-effort: apply any pending sync once metadata is available.
                     setTimeout(() => applyPendingIfPossible(), 0);
                   }}
                 />
