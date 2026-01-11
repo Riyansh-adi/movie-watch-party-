@@ -250,11 +250,14 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
           <div className="grid gap-4 lg:grid-cols-[2fr_1fr]">
             <div className="rounded-2xl border border-zinc-200 bg-black/95">
+              {/* ✅ FIXED VIDEO PLAYER */}
               <video
                 ref={videoRef}
                 className="aspect-video w-full rounded-2xl"
                 src={videoUrl ?? undefined}
-                controls={isHost}
+                controls
+                playsInline
+                preload="metadata"
                 onLoadedMetadata={() => applyPendingIfPossible()}
                 onError={() => {
                   setFormatNote(
@@ -264,26 +267,53 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                 onPlay={() => {
                   const video = videoRef.current;
                   if (!video) return;
-                  if (!canControl) return;
-                  if (applyingRemoteRef.current) return;
 
-                  socket.emit("sync:action", { code, action: "play", time: video.currentTime });
+                  // ✅ Guest can see controls, but cannot control.
+                  // If guest tries to play, revert.
+                  if (!canControl) {
+                    if (!applyingRemoteRef.current) video.pause();
+                    return;
+                  }
+
+                  if (applyingRemoteRef.current) return;
+                  socket.emit("sync:action", {
+                    code,
+                    action: "play",
+                    time: video.currentTime,
+                  });
                 }}
                 onPause={() => {
                   const video = videoRef.current;
                   if (!video) return;
-                  if (!canControl) return;
-                  if (applyingRemoteRef.current) return;
 
-                  socket.emit("sync:action", { code, action: "pause", time: video.currentTime });
+                  // ✅ Guest tries pause => revert back to play (if host is playing, status sync fixes it)
+                  if (!canControl) {
+                    if (!applyingRemoteRef.current) void safePlay(video);
+                    return;
+                  }
+
+                  if (applyingRemoteRef.current) return;
+                  socket.emit("sync:action", {
+                    code,
+                    action: "pause",
+                    time: video.currentTime,
+                  });
                 }}
                 onSeeked={() => {
                   const video = videoRef.current;
                   if (!video) return;
-                  if (!canControl) return;
-                  if (applyingRemoteRef.current) return;
 
-                  socket.emit("sync:action", { code, action: "seek", time: video.currentTime });
+                  // ✅ Guest tries seeking => ignore; next host status will correct drift
+                  if (!canControl) {
+                    return;
+                  }
+
+                  if (applyingRemoteRef.current) return;
+                  socket.emit("sync:action", {
+                    code,
+                    action: "seek",
+                    time: video.currentTime,
+                  });
                 }}
               />
             </div>
@@ -298,8 +328,6 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                 <span className="sr-only">Choose video</span>
                 <input
                   type="file"
-                  // Note: this only affects what files can be selected.
-                  // Actual playback depends on browser codec support.
                   accept="video/*,audio/*,.mkv,.mp4,.webm,.mov,.m4v,.avi,.mp3,.m4a,.wav,.ogg"
                   className="block w-full cursor-pointer rounded-xl border border-zinc-200 bg-white p-2 text-sm file:mr-4 file:rounded-lg file:border-0 file:bg-zinc-900 file:px-3 file:py-2 file:text-sm file:font-semibold file:text-white hover:bg-zinc-50"
                   onChange={(e) => {
@@ -315,7 +343,6 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
                     const video = videoRef.current;
                     if (video) {
-                      // file.type can be empty for some files (e.g., .mkv on Windows).
                       const mime = file.type;
                       if (mime) {
                         const can = video.canPlayType(mime);
