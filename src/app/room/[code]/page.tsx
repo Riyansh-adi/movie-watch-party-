@@ -79,9 +79,11 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       } catch {}
 
       if (action === "play") {
-        await safePlay(video);
+        if (video.paused && !video.ended) {
+          await safePlay(video);
+        }
       } else if (action === "pause") {
-        video.pause();
+        if (!video.paused) video.pause();
       }
     } finally {
       setTimeout(() => {
@@ -110,9 +112,9 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       }
 
       if (isPlaying) {
-        void safePlay(video);
+        if (video.paused && !video.ended) void safePlay(video);
       } else {
-        video.pause();
+        if (!video.paused) video.pause();
       }
     } finally {
       setTimeout(() => {
@@ -262,31 +264,35 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                     "This format may not be supported by your browser. Try MP4 (H.264/AAC) or WebM if playback fails."
                   );
                 }}
-                onPlay={() => {
+                onPlay={(e) => {
                   const video = videoRef.current;
                   if (!video) return;
 
                   if (!canControl) return;
 
-                  if (shouldSuppressLocalEmit()) return;
+                  const isTrusted = (e.nativeEvent as Event | undefined)?.isTrusted === true;
+                  // Always honor real user intent, even if we are in a short remote-apply window.
+                  if (!isTrusted && shouldSuppressLocalEmit()) return;
                   socket.emit("sync:action", { code, action: "play", time: video.currentTime });
                 }}
-                onPause={() => {
+                onPause={(e) => {
                   const video = videoRef.current;
                   if (!video) return;
 
                   if (!canControl) return;
 
-                  if (shouldSuppressLocalEmit()) return;
+                  const isTrusted = (e.nativeEvent as Event | undefined)?.isTrusted === true;
+                  if (!isTrusted && shouldSuppressLocalEmit()) return;
                   socket.emit("sync:action", { code, action: "pause", time: video.currentTime });
                 }}
-                onSeeked={() => {
+                onSeeked={(e) => {
                   const video = videoRef.current;
                   if (!video) return;
 
                   if (!canControl) return;
 
-                  if (shouldSuppressLocalEmit()) return;
+                  const isTrusted = (e.nativeEvent as Event | undefined)?.isTrusted === true;
+                  if (!isTrusted && shouldSuppressLocalEmit()) return;
                   socket.emit("sync:action", { code, action: "seek", time: video.currentTime });
                 }}
               />
