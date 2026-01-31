@@ -271,8 +271,8 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                   if (!canControl) return;
 
                   const isTrusted = (e.nativeEvent as Event | undefined)?.isTrusted === true;
-                  // Always honor real user intent, even if we are in a short remote-apply window.
-                  if (!isTrusted && shouldSuppressLocalEmit()) return;
+                  // Only emit for real user gestures to avoid feedback loops from programmatic play().
+                  if (!isTrusted) return;
                   socket.emit("sync:action", { code, action: "play", time: video.currentTime });
                 }}
                 onPause={(e) => {
@@ -282,7 +282,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                   if (!canControl) return;
 
                   const isTrusted = (e.nativeEvent as Event | undefined)?.isTrusted === true;
-                  if (!isTrusted && shouldSuppressLocalEmit()) return;
+                  if (!isTrusted) return;
                   socket.emit("sync:action", { code, action: "pause", time: video.currentTime });
                 }}
                 onSeeked={(e) => {
@@ -292,7 +292,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                   if (!canControl) return;
 
                   const isTrusted = (e.nativeEvent as Event | undefined)?.isTrusted === true;
-                  if (!isTrusted && shouldSuppressLocalEmit()) return;
+                  if (!isTrusted) return;
                   socket.emit("sync:action", { code, action: "seek", time: video.currentTime });
                 }}
               />
