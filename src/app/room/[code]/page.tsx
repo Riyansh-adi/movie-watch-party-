@@ -15,7 +15,7 @@ type SyncAction = {
   time: number;
 };
 
-type SyncStatus = {
+type SyncState = {
   currentTime: number;
   isPlaying: boolean;
 };
@@ -37,7 +37,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const applyingRemoteRef = useRef(false);
   const pendingActionRef = useRef<SyncAction | null>(null);
-  const pendingStatusRef = useRef<SyncStatus | null>(null);
+  const pendingStateRef = useRef<SyncState | null>(null);
 
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
@@ -62,10 +62,10 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       void handleRemoteAction(action);
     }
 
-    if (pendingStatusRef.current) {
-      const status = pendingStatusRef.current;
-      pendingStatusRef.current = null;
-      handleRemoteStatus(status);
+    if (pendingStateRef.current) {
+      const state = pendingStateRef.current;
+      pendingStateRef.current = null;
+      handleRemoteState(state);
     }
   }
 
@@ -96,12 +96,12 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     }
   }
 
-  function handleRemoteStatus({ currentTime, isPlaying }: SyncStatus) {
+  function handleRemoteState({ currentTime, isPlaying }: SyncState) {
     const video = videoRef.current;
     if (!video) return;
 
     if (video.readyState < 1) {
-      pendingStatusRef.current = { currentTime, isPlaying };
+      pendingStateRef.current = { currentTime, isPlaying };
       return;
     }
 
@@ -153,7 +153,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     socket.on("room:error", onRoomError);
     socket.on("room:closed", onRoomClosed);
     socket.on("sync:action", handleRemoteAction);
-    socket.on("sync:status", handleRemoteStatus);
+    socket.on("sync:state", handleRemoteState);
 
     if (socket.connected) onConnect();
 
@@ -163,27 +163,21 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       socket.off("room:error", onRoomError);
       socket.off("room:closed", onRoomClosed);
       socket.off("sync:action", handleRemoteAction);
-      socket.off("sync:status", handleRemoteStatus);
+      socket.off("sync:state", handleRemoteState);
     };
   }, [code, socket]);
 
   useEffect(() => {
-    if (!isHost) return;
-
     const id = setInterval(() => {
-      const video = videoRef.current;
-      if (!video) return;
       if (!socket.connected) return;
 
-      socket.emit("sync:status", {
-        code,
-        currentTime: video.currentTime,
-        isPlaying: !video.paused && !video.ended,
+      socket.emit("sync:request", { code }, (state: SyncState) => {
+        handleRemoteState(state);
       });
     }, 5000);
 
     return () => clearInterval(id);
-  }, [code, isHost, socket]);
+  }, [code, socket]);
 
   useEffect(() => {
     return () => {
@@ -191,7 +185,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     };
   }, [videoUrl]);
 
-  const canControl = isHost && !closed && !error;
+  const canControl = !closed && !error;
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900">
@@ -259,11 +253,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                   const video = videoRef.current;
                   if (!video) return;
 
-                  // guest pressed play => revert
-                  if (!canControl) {
-                    if (!applyingRemoteRef.current) video.pause();
-                    return;
-                  }
+                  if (!canControl) return;
 
                   if (applyingRemoteRef.current) return;
                   socket.emit("sync:action", { code, action: "play", time: video.currentTime });
@@ -272,7 +262,6 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                   const video = videoRef.current;
                   if (!video) return;
 
-                  // guest pressed pause => ignore (host status will resync)
                   if (!canControl) return;
 
                   if (applyingRemoteRef.current) return;
@@ -282,7 +271,6 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                   const video = videoRef.current;
                   if (!video) return;
 
-                  // guest tried seek => ignore
                   if (!canControl) return;
 
                   if (applyingRemoteRef.current) return;
@@ -342,17 +330,9 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                 </div>
               )}
 
-              {!isHost && (
-                <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-700">
-                  Only the host can control playback. Your player will mirror host play/pause/seek.
-                </div>
-              )}
-
-              {isHost && (
-                <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-700">
-                  You control playback. Guests sync instantly + drift-correct every 5 seconds.
-                </div>
-              )}
+              <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-700">
+                Everyone can control playback. Any play/pause/seek will sync to the whole room.
+              </div>
             </div>
           </div>
         </div>

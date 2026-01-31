@@ -60,6 +60,16 @@ function emitRoomInfo(code: RoomCode) {
   });
 }
 
+function getComputedRoomState(room: Room) {
+  const now = Date.now();
+  const elapsedSeconds = room.isPlaying ? (now - room.lastUpdated) / 1000 : 0;
+  const currentTime = Math.max(0, room.currentTime + elapsedSeconds);
+  return {
+    currentTime,
+    isPlaying: room.isPlaying,
+  };
+}
+
 io.on("connection", (socket) => {
   // CREATE ROOM
   socket.on("room:create", () => {
@@ -95,10 +105,7 @@ io.on("connection", (socket) => {
     socket.join(room.code);
 
     // 👉 NEW USER ko current video state bhejo
-    socket.emit("sync:state", {
-      currentTime: room.currentTime,
-      isPlaying: room.isPlaying,
-    });
+    socket.emit("sync:state", getComputedRoomState(room));
 
     socket.emit("room:joined", { code: room.code });
     emitRoomInfo(room.code);
@@ -116,26 +123,40 @@ io.on("connection", (socket) => {
       action: "play" | "pause" | "seek";
       time: number;
     }) => {
-      const room = rooms.get(code);
+      const normalized = code.trim().toUpperCase();
+      const room = rooms.get(normalized);
       if (!room) return;
 
       const now = Date.now();
 
-      // agar video chal rahi thi to time update karo
-      if (room.isPlaying) {
-        room.currentTime += (now - room.lastUpdated) / 1000;
-      }
-
+      room.currentTime = Number.isFinite(time) ? Math.max(0, time) : room.currentTime;
       room.lastUpdated = now;
 
       if (action === "play") room.isPlaying = true;
       if (action === "pause") room.isPlaying = false;
-      if (action === "seek") room.currentTime = time;
 
-      io.to(code).emit("sync:action", {
+      io.to(room.code).emit("sync:action", {
         action,
         time: room.currentTime,
       });
+    }
+  );
+
+  // STATE REQUEST (ANY USER)
+  socket.on(
+    "sync:request",
+    ({ code }: { code: string }, cb?: (state: { currentTime: number; isPlaying: boolean }) => void) => {
+      const normalized = code.trim().toUpperCase();
+      const room = rooms.get(normalized);
+      if (!room) return;
+
+      const state = getComputedRoomState(room);
+      if (cb) {
+        cb(state);
+        return;
+      }
+
+      socket.emit("sync:state", state);
     }
   );
 
@@ -147,8 +168,13 @@ io.on("connection", (socket) => {
       room.sockets.delete(socket.id);
 
       if (room.hostSocketId === socket.id) {
-        io.to(code).emit("room:closed");
-        rooms.delete(code);
+        const nextHost = room.sockets.values().next().value as string | undefined;
+        if (!nextHost) {
+          rooms.delete(code);
+          continue;
+        }
+        room.hostSocketId = nextHost;
+        emitRoomInfo(code);
         continue;
       }
 
