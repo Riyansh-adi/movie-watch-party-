@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { getSocket } from "@/lib/socket";
 
@@ -36,6 +36,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const applyingRemoteRef = useRef(false);
+  const suppressEmitsUntilRef = useRef<number>(0);
   const pendingActionRef = useRef<SyncAction | null>(null);
   const pendingStateRef = useRef<SyncState | null>(null);
 
@@ -51,25 +52,16 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
   const isHost = !!selfId && !!hostId && selfId === hostId;
 
-  function applyPendingIfPossible() {
-    const video = videoRef.current;
-    if (!video) return;
-    if (video.readyState < 1) return;
+  const suppressLocalEmits = useCallback((ms: number) => {
+    const until = Date.now() + ms;
+    suppressEmitsUntilRef.current = Math.max(suppressEmitsUntilRef.current, until);
+  }, []);
 
-    if (pendingActionRef.current) {
-      const action = pendingActionRef.current;
-      pendingActionRef.current = null;
-      void handleRemoteAction(action);
-    }
+  const shouldSuppressLocalEmit = useCallback(() => {
+    return applyingRemoteRef.current || Date.now() < suppressEmitsUntilRef.current;
+  }, []);
 
-    if (pendingStateRef.current) {
-      const state = pendingStateRef.current;
-      pendingStateRef.current = null;
-      handleRemoteState(state);
-    }
-  }
-
-  async function handleRemoteAction({ action, time }: SyncAction) {
+  const handleRemoteAction = useCallback(async ({ action, time }: SyncAction) => {
     const video = videoRef.current;
     if (!video) return;
 
@@ -79,6 +71,8 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     }
 
     applyingRemoteRef.current = true;
+    // Keep suppression long enough to cover delayed media events triggered by play()/pause()/seek.
+    suppressLocalEmits(800);
     try {
       try {
         video.currentTime = time;
@@ -92,11 +86,11 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     } finally {
       setTimeout(() => {
         applyingRemoteRef.current = false;
-      }, 0);
+      }, 500);
     }
-  }
+  }, [suppressLocalEmits]);
 
-  function handleRemoteState({ currentTime, isPlaying }: SyncState) {
+  const handleRemoteState = useCallback(({ currentTime, isPlaying }: SyncState) => {
     const video = videoRef.current;
     if (!video) return;
 
@@ -106,6 +100,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     }
 
     applyingRemoteRef.current = true;
+    suppressLocalEmits(800);
     try {
       const diff = Math.abs(video.currentTime - currentTime);
       if (diff > 0.5) {
@@ -122,9 +117,27 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     } finally {
       setTimeout(() => {
         applyingRemoteRef.current = false;
-      }, 0);
+      }, 500);
     }
-  }
+  }, [suppressLocalEmits]);
+
+  const applyPendingIfPossible = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.readyState < 1) return;
+
+    if (pendingActionRef.current) {
+      const action = pendingActionRef.current;
+      pendingActionRef.current = null;
+      void handleRemoteAction(action);
+    }
+
+    if (pendingStateRef.current) {
+      const state = pendingStateRef.current;
+      pendingStateRef.current = null;
+      handleRemoteState(state);
+    }
+  }, [handleRemoteAction, handleRemoteState]);
 
   useEffect(() => {
     setError(null);
@@ -165,7 +178,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       socket.off("sync:action", handleRemoteAction);
       socket.off("sync:state", handleRemoteState);
     };
-  }, [code, socket]);
+  }, [code, handleRemoteAction, handleRemoteState, socket]);
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -177,7 +190,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     }, 5000);
 
     return () => clearInterval(id);
-  }, [code, socket]);
+  }, [code, handleRemoteState, socket]);
 
   useEffect(() => {
     return () => {
@@ -255,7 +268,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
                   if (!canControl) return;
 
-                  if (applyingRemoteRef.current) return;
+                  if (shouldSuppressLocalEmit()) return;
                   socket.emit("sync:action", { code, action: "play", time: video.currentTime });
                 }}
                 onPause={() => {
@@ -264,7 +277,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
                   if (!canControl) return;
 
-                  if (applyingRemoteRef.current) return;
+                  if (shouldSuppressLocalEmit()) return;
                   socket.emit("sync:action", { code, action: "pause", time: video.currentTime });
                 }}
                 onSeeked={() => {
@@ -273,7 +286,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
                   if (!canControl) return;
 
-                  if (applyingRemoteRef.current) return;
+                  if (shouldSuppressLocalEmit()) return;
                   socket.emit("sync:action", { code, action: "seek", time: video.currentTime });
                 }}
               />

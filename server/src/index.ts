@@ -135,7 +135,8 @@ io.on("connection", (socket) => {
       if (action === "play") room.isPlaying = true;
       if (action === "pause") room.isPlaying = false;
 
-      io.to(room.code).emit("sync:action", {
+      // Broadcast to everyone else; the sender already applied the action locally.
+      socket.to(room.code).emit("sync:action", {
         action,
         time: room.currentTime,
       });
