@@ -70,6 +70,18 @@ function getComputedRoomState(room: Room) {
   };
 }
 
+function emitSyncState(code: RoomCode, payload?: { by?: string; action?: "play" | "pause" | "seek" | "state" }) {
+  const room = rooms.get(code);
+  if (!room) return;
+
+  const state = getComputedRoomState(room);
+  io.to(code).emit("sync:state", {
+    ...state,
+    ...payload,
+    serverTime: Date.now(),
+  });
+}
+
 io.on("connection", (socket) => {
   // CREATE ROOM
   socket.on("room:create", (cb?: (payload: { code: string }) => void) => {
@@ -105,8 +117,12 @@ io.on("connection", (socket) => {
     room.sockets.add(socket.id);
     socket.join(room.code);
 
-    // 👉 NEW USER ko current video state bhejo
-    socket.emit("sync:state", getComputedRoomState(room));
+    // Send current room state snapshot to the new user.
+    socket.emit("sync:state", {
+      ...getComputedRoomState(room),
+      action: "state",
+      serverTime: Date.now(),
+    });
 
     socket.emit("room:joined", { code: room.code });
     emitRoomInfo(room.code);
@@ -136,25 +152,31 @@ io.on("connection", (socket) => {
       if (action === "play") room.isPlaying = true;
       if (action === "pause") room.isPlaying = false;
 
-      // Broadcast to everyone else; the sender already applied the action locally.
-      socket.to(room.code).emit("sync:action", {
-        action,
-        time: room.currentTime,
-      });
+      // For seek, we keep current isPlaying and just move the clock.
+
+      // Broadcast authoritative state to everyone (including sender) so all clients converge.
+      emitSyncState(room.code, { by: socket.id, action });
     }
   );
 
   // STATE REQUEST (ANY USER)
   socket.on(
     "sync:request",
-    ({ code }: { code: string }, cb?: (state: { currentTime: number; isPlaying: boolean }) => void) => {
+    (
+      { code }: { code: string },
+      cb?: (state: { currentTime: number; isPlaying: boolean; action?: "state"; serverTime?: number }) => void
+    ) => {
       const normalized = code.trim().toUpperCase();
       const room = rooms.get(normalized);
       if (!room) return;
 
       const state = getComputedRoomState(room);
       if (cb) {
-        cb(state);
+        cb({
+          ...state,
+          action: "state",
+          serverTime: Date.now(),
+        });
         return;
       }
 

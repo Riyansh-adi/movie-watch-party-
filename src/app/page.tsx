@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { getSocket } from "@/lib/socket";
 
@@ -13,7 +13,7 @@ export default function Home() {
   const createTimeoutRef = useRef<number | null>(null);
   const createConnectHandlerRef = useRef<(() => void) | null>(null);
 
-  const clearCreatePending = () => {
+  const clearCreatePending = useCallback(() => {
     if (createTimeoutRef.current) {
       window.clearTimeout(createTimeoutRef.current);
       createTimeoutRef.current = null;
@@ -23,7 +23,7 @@ export default function Home() {
       socket.off("connect", createConnectHandlerRef.current);
       createConnectHandlerRef.current = null;
     }
-  };
+  }, [socket]);
 
   useEffect(() => {
     function onCreated(payload: { code: string }) {
@@ -55,7 +55,7 @@ export default function Home() {
       socket.off("room:error", onRoomError);
       socket.off("connect_error", onConnectError);
     };
-  }, [router, socket]);
+  }, [clearCreatePending, router, socket]);
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900">

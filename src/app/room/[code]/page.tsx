@@ -10,21 +10,25 @@ type RoomInfo = {
   usersCount: number;
 };
 
-type SyncAction = {
-  action: "play" | "pause" | "seek";
-  time: number;
-};
-
 type SyncState = {
   currentTime: number;
   isPlaying: boolean;
 };
 
+type SyncStatePayload = SyncState & {
+  // Optional metadata for debugging / future improvements.
+  by?: string;
+  action?: "play" | "pause" | "seek" | "state";
+  serverTime?: number;
+};
+
 async function safePlay(video: HTMLVideoElement) {
   try {
     await video.play();
+    return true;
   } catch {
     // Autoplay can be blocked; ignore.
+    return false;
   }
 }
 
@@ -37,8 +41,9 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const applyingRemoteRef = useRef(false);
   const suppressEmitsUntilRef = useRef<number>(0);
-  const pendingActionRef = useRef<SyncAction | null>(null);
-  const pendingStateRef = useRef<SyncState | null>(null);
+  const isUserSeekingRef = useRef(false);
+  const pendingStateRef = useRef<SyncStatePayload | null>(null);
+  const desiredPlayingStateRef = useRef<SyncStatePayload | null>(null);
 
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
@@ -49,6 +54,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   const [error, setError] = useState<string | null>(null);
   const [closed, setClosed] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [needsGesture, setNeedsGesture] = useState(false);
 
   const isHost = !!selfId && !!hostId && selfId === hostId;
 
@@ -61,60 +67,53 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     return applyingRemoteRef.current || Date.now() < suppressEmitsUntilRef.current;
   }, []);
 
-  const handleRemoteAction = useCallback(async ({ action, time }: SyncAction) => {
+  const applyRemoteState = useCallback(async (payload: SyncStatePayload) => {
     const video = videoRef.current;
     if (!video) return;
 
     if (video.readyState < 1) {
-      pendingActionRef.current = { action, time };
+      pendingStateRef.current = payload;
       return;
     }
 
-    applyingRemoteRef.current = true;
-    // Keep suppression long enough to cover delayed media events triggered by play()/pause()/seek.
-    suppressLocalEmits(800);
-    try {
-      try {
-        video.currentTime = time;
-      } catch {}
-
-      if (action === "play") {
-        if (video.paused && !video.ended) {
-          await safePlay(video);
-        }
-      } else if (action === "pause") {
-        if (!video.paused) video.pause();
-      }
-    } finally {
-      setTimeout(() => {
-        applyingRemoteRef.current = false;
-      }, 500);
-    }
-  }, [suppressLocalEmits]);
-
-  const handleRemoteState = useCallback(({ currentTime, isPlaying }: SyncState) => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    if (video.readyState < 1) {
-      pendingStateRef.current = { currentTime, isPlaying };
+    // Don't fight the user while they're scrubbing.
+    if (isUserSeekingRef.current) {
+      pendingStateRef.current = payload;
       return;
     }
 
+    const { currentTime, isPlaying } = payload;
+
     applyingRemoteRef.current = true;
-    suppressLocalEmits(800);
+
+    // Keep suppression long enough to cover delayed media events.
+    suppressLocalEmits(1000);
     try {
       const diff = Math.abs(video.currentTime - currentTime);
-      if (diff > 0.5) {
+
+      // Only hard-seek when the drift is noticeable.
+      // While paused, be strict; while playing, allow small drift to avoid jitter.
+      const threshold = isPlaying ? 0.75 : 0.15;
+      if (diff > threshold) {
         try {
           video.currentTime = currentTime;
         } catch {}
       }
 
       if (isPlaying) {
-        if (video.paused && !video.ended) void safePlay(video);
+        if (video.paused && !video.ended) {
+          const ok = await safePlay(video);
+          if (!ok) {
+            // Autoplay blocked (common on remote-triggered play). Ask for one click.
+            desiredPlayingStateRef.current = payload;
+            setNeedsGesture(true);
+          } else {
+            setNeedsGesture(false);
+          }
+        }
       } else {
         if (!video.paused) video.pause();
+        setNeedsGesture(false);
       }
     } finally {
       setTimeout(() => {
@@ -128,18 +127,14 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     if (!video) return;
     if (video.readyState < 1) return;
 
-    if (pendingActionRef.current) {
-      const action = pendingActionRef.current;
-      pendingActionRef.current = null;
-      void handleRemoteAction(action);
-    }
+    if (isUserSeekingRef.current) return;
 
     if (pendingStateRef.current) {
       const state = pendingStateRef.current;
       pendingStateRef.current = null;
-      handleRemoteState(state);
+      void applyRemoteState(state);
     }
-  }, [handleRemoteAction, handleRemoteState]);
+  }, [applyRemoteState]);
 
   useEffect(() => {
     setError(null);
@@ -148,6 +143,9 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     function onConnect() {
       setSelfId(socket.id ?? null);
       socket.emit("room:join", { code });
+      socket.emit("sync:request", { code }, (state: SyncStatePayload) => {
+        void applyRemoteState({ ...state, action: "state" });
+      });
     }
 
     function onRoomInfo(info: RoomInfo) {
@@ -167,8 +165,9 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     socket.on("room:info", onRoomInfo);
     socket.on("room:error", onRoomError);
     socket.on("room:closed", onRoomClosed);
-    socket.on("sync:action", handleRemoteAction);
-    socket.on("sync:state", handleRemoteState);
+    socket.on("sync:state", (state: SyncStatePayload) => {
+      void applyRemoteState(state);
+    });
 
     if (socket.connected) onConnect();
 
@@ -177,22 +176,29 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       socket.off("room:info", onRoomInfo);
       socket.off("room:error", onRoomError);
       socket.off("room:closed", onRoomClosed);
-      socket.off("sync:action", handleRemoteAction);
-      socket.off("sync:state", handleRemoteState);
+      socket.off("sync:state");
     };
-  }, [code, handleRemoteAction, handleRemoteState, socket]);
+  }, [applyRemoteState, code, socket]);
 
   useEffect(() => {
+    // Light drift correction to keep both sides aligned.
+    // Skip while user is scrubbing or when we don't have a loaded media element.
     const id = setInterval(() => {
       if (!socket.connected) return;
+      const video = videoRef.current;
+      if (!video) return;
+      if (video.readyState < 1) return;
+      if (isUserSeekingRef.current) return;
 
-      socket.emit("sync:request", { code }, (state: SyncState) => {
-        handleRemoteState(state);
+      socket.emit("sync:request", { code }, (state: SyncStatePayload) => {
+        // Apply only if we're noticeably off.
+        const diff = Math.abs(video.currentTime - state.currentTime);
+        if (diff > 1.0) void applyRemoteState({ ...state, action: "state" });
       });
-    }, 5000);
+    }, 10000);
 
     return () => clearInterval(id);
-  }, [code, handleRemoteState, socket]);
+  }, [applyRemoteState, code, socket]);
 
   useEffect(() => {
     return () => {
@@ -201,6 +207,56 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   }, [videoUrl]);
 
   const canControl = !closed && !error;
+
+  // Attach native media event listeners so we can use the real DOM event's isTrusted.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const onPlay = (ev: Event) => {
+      if (!canControl) return;
+      if (shouldSuppressLocalEmit()) return;
+      if (!ev.isTrusted) return;
+
+      socket.emit("sync:action", { code, action: "play", time: video.currentTime });
+    };
+
+    const onPause = (ev: Event) => {
+      if (!canControl) return;
+      if (shouldSuppressLocalEmit()) return;
+      if (!ev.isTrusted) return;
+
+      socket.emit("sync:action", { code, action: "pause", time: video.currentTime });
+    };
+
+    const onSeeking = (ev: Event) => {
+      if (!ev.isTrusted) return;
+      isUserSeekingRef.current = true;
+    };
+
+    const onSeeked = (ev: Event) => {
+      if (!canControl) return;
+      if (!ev.isTrusted) return;
+      isUserSeekingRef.current = false;
+
+      // Emit only once the seek completes.
+      socket.emit("sync:action", { code, action: "seek", time: video.currentTime });
+      // Apply any queued remote state after user finishes scrubbing.
+      applyPendingIfPossible();
+    };
+
+    video.addEventListener("play", onPlay);
+    video.addEventListener("pause", onPause);
+    video.addEventListener("seeking", onSeeking);
+    video.addEventListener("seeked", onSeeked);
+
+    return () => {
+      video.removeEventListener("play", onPlay);
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("seeking", onSeeking);
+      video.removeEventListener("seeked", onSeeked);
+    };
+  }, [applyPendingIfPossible, canControl, code, shouldSuppressLocalEmit, socket]);
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900">
@@ -250,7 +306,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
           )}
 
           <div className="grid gap-4 lg:grid-cols-[2fr_1fr]">
-            <div className="rounded-2xl border border-zinc-200 bg-black/95">
+            <div className="relative rounded-2xl border border-zinc-200 bg-black/95">
               <video
                 ref={videoRef}
                 className="aspect-video w-full rounded-2xl"
@@ -264,38 +320,39 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                     "This format may not be supported by your browser. Try MP4 (H.264/AAC) or WebM if playback fails."
                   );
                 }}
-                onPlay={(e) => {
-                  const video = videoRef.current;
-                  if (!video) return;
-
-                  if (!canControl) return;
-
-                  const isTrusted = (e.nativeEvent as Event | undefined)?.isTrusted === true;
-                  // Only emit for real user gestures to avoid feedback loops from programmatic play().
-                  if (!isTrusted) return;
-                  socket.emit("sync:action", { code, action: "play", time: video.currentTime });
-                }}
-                onPause={(e) => {
-                  const video = videoRef.current;
-                  if (!video) return;
-
-                  if (!canControl) return;
-
-                  const isTrusted = (e.nativeEvent as Event | undefined)?.isTrusted === true;
-                  if (!isTrusted) return;
-                  socket.emit("sync:action", { code, action: "pause", time: video.currentTime });
-                }}
-                onSeeked={(e) => {
-                  const video = videoRef.current;
-                  if (!video) return;
-
-                  if (!canControl) return;
-
-                  const isTrusted = (e.nativeEvent as Event | undefined)?.isTrusted === true;
-                  if (!isTrusted) return;
-                  socket.emit("sync:action", { code, action: "seek", time: video.currentTime });
-                }}
               />
+
+              {needsGesture && (
+                <div className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/60 p-4">
+                  <div className="w-full max-w-sm rounded-2xl border border-white/10 bg-zinc-950/80 p-4 text-center text-white">
+                    <div className="text-sm font-semibold">Playback needs one click</div>
+                    <div className="mt-2 text-xs text-zinc-200">
+                      Your browser blocked autoplay. Click below once to resume synced playback.
+                    </div>
+                    <button
+                      className="mt-3 w-full rounded-xl bg-white px-4 py-2 text-sm font-semibold text-zinc-900 hover:bg-zinc-100"
+                      onClick={async () => {
+                        const video = videoRef.current;
+                        const desired = desiredPlayingStateRef.current;
+                        if (!video || !desired) return;
+
+                        // Seek first, then try play in the user gesture.
+                        try {
+                          video.currentTime = desired.currentTime;
+                        } catch {}
+
+                        const ok = await safePlay(video);
+                        if (ok) {
+                          setNeedsGesture(false);
+                          desiredPlayingStateRef.current = null;
+                        }
+                      }}
+                    >
+                      Start playback
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="flex flex-col gap-3 rounded-2xl border border-zinc-200 bg-white p-4">
