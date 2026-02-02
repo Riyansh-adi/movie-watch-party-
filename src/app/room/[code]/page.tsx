@@ -10,24 +10,22 @@ type RoomInfo = {
   usersCount: number;
 };
 
-type SyncState = {
-  currentTime: number;
+type PlaybackActionType = "play" | "pause" | "seek";
+
+type PlaybackState = {
   isPlaying: boolean;
-};
-
-type SyncStatePayload = SyncState & {
-  // Optional metadata for debugging / future improvements.
+  positionSeconds: number;
+  seq: number;
+  serverTimeMs: number;
   by?: string;
-  action?: "play" | "pause" | "seek" | "state";
-  serverTime?: number;
+  action?: PlaybackActionType | "state";
 };
 
-async function safePlay(video: HTMLVideoElement) {
+async function tryPlay(video: HTMLVideoElement) {
   try {
     await video.play();
     return true;
   } catch {
-    // Autoplay can be blocked; ignore.
     return false;
   }
 }
@@ -40,10 +38,11 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const applyingRemoteRef = useRef(false);
-  const suppressEmitsUntilRef = useRef<number>(0);
+  const suppressEmitsUntilRef = useRef(0);
   const isUserSeekingRef = useRef(false);
-  const pendingStateRef = useRef<SyncStatePayload | null>(null);
-  const desiredPlayingStateRef = useRef<SyncStatePayload | null>(null);
+  const pendingStateRef = useRef<PlaybackState | null>(null);
+  const lastSeqAppliedRef = useRef<number>(-1);
+  const blockedAutoplayStateRef = useRef<PlaybackState | null>(null);
 
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
@@ -59,68 +58,83 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   const isHost = !!selfId && !!hostId && selfId === hostId;
 
   const suppressLocalEmits = useCallback((ms: number) => {
-    const until = Date.now() + ms;
-    suppressEmitsUntilRef.current = Math.max(suppressEmitsUntilRef.current, until);
+    suppressEmitsUntilRef.current = Math.max(suppressEmitsUntilRef.current, Date.now() + ms);
   }, []);
 
-  const shouldSuppressLocalEmit = useCallback(() => {
-    return applyingRemoteRef.current || Date.now() < suppressEmitsUntilRef.current;
+  const shouldEmitUserEvent = useCallback((ev: Event) => {
+    if (!ev.isTrusted) return false;
+    if (applyingRemoteRef.current) return false;
+    if (Date.now() < suppressEmitsUntilRef.current) return false;
+    if (closed || !!error) return false;
+    return true;
+  }, [closed, error]);
+
+  const computeTargetTimeSeconds = useCallback((state: PlaybackState) => {
+    const nowMs = Date.now();
+    const ageSeconds = Math.max(0, (nowMs - state.serverTimeMs) / 1000);
+    return state.isPlaying ? state.positionSeconds + ageSeconds : state.positionSeconds;
   }, []);
 
-  const applyRemoteState = useCallback(async (payload: SyncStatePayload) => {
+  const applyPlaybackStateToVideo = useCallback(async (state: PlaybackState) => {
     const video = videoRef.current;
     if (!video) return;
 
+    // Ignore older/out-of-order states.
+    if (state.seq <= lastSeqAppliedRef.current) return;
+
     if (video.readyState < 1) {
-      pendingStateRef.current = payload;
+      pendingStateRef.current = state;
       return;
     }
 
     // Don't fight the user while they're scrubbing.
     if (isUserSeekingRef.current) {
-      pendingStateRef.current = payload;
+      pendingStateRef.current = state;
       return;
     }
 
-    const { currentTime, isPlaying } = payload;
+    const targetTimeSeconds = computeTargetTimeSeconds(state);
 
     applyingRemoteRef.current = true;
 
-    // Keep suppression long enough to cover delayed media events.
-    suppressLocalEmits(1000);
+    // Keep suppression long enough to cover delayed media events fired by play/pause/seek.
+    suppressLocalEmits(900);
     try {
-      const diff = Math.abs(video.currentTime - currentTime);
+      // Drift correction.
+      const diff = targetTimeSeconds - video.currentTime;
+      const abs = Math.abs(diff);
+      const threshold = state.isPlaying ? 0.5 : 0.12;
 
-      // Only hard-seek when the drift is noticeable.
-      // While paused, be strict; while playing, allow small drift to avoid jitter.
-      const threshold = isPlaying ? 0.75 : 0.15;
-      if (diff > threshold) {
+      if (abs > threshold) {
         try {
-          video.currentTime = currentTime;
+          video.currentTime = Math.max(0, targetTimeSeconds);
         } catch {}
       }
 
-      if (isPlaying) {
+      if (state.isPlaying) {
         if (video.paused && !video.ended) {
-          const ok = await safePlay(video);
+          const ok = await tryPlay(video);
           if (!ok) {
-            // Autoplay blocked (common on remote-triggered play). Ask for one click.
-            desiredPlayingStateRef.current = payload;
+            blockedAutoplayStateRef.current = state;
             setNeedsGesture(true);
           } else {
+            blockedAutoplayStateRef.current = null;
             setNeedsGesture(false);
           }
         }
       } else {
         if (!video.paused) video.pause();
+        blockedAutoplayStateRef.current = null;
         setNeedsGesture(false);
       }
+
+      lastSeqAppliedRef.current = state.seq;
     } finally {
       setTimeout(() => {
         applyingRemoteRef.current = false;
       }, 500);
     }
-  }, [suppressLocalEmits]);
+  }, [computeTargetTimeSeconds, suppressLocalEmits]);
 
   const applyPendingIfPossible = useCallback(() => {
     const video = videoRef.current;
@@ -132,9 +146,9 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     if (pendingStateRef.current) {
       const state = pendingStateRef.current;
       pendingStateRef.current = null;
-      void applyRemoteState(state);
+      void applyPlaybackStateToVideo(state);
     }
-  }, [applyRemoteState]);
+  }, [applyPlaybackStateToVideo]);
 
   useEffect(() => {
     setError(null);
@@ -143,8 +157,8 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     function onConnect() {
       setSelfId(socket.id ?? null);
       socket.emit("room:join", { code });
-      socket.emit("sync:request", { code }, (state: SyncStatePayload) => {
-        void applyRemoteState({ ...state, action: "state" });
+      socket.emit("playback:request", { code }, (state: PlaybackState) => {
+        void applyPlaybackStateToVideo(state);
       });
     }
 
@@ -165,8 +179,8 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     socket.on("room:info", onRoomInfo);
     socket.on("room:error", onRoomError);
     socket.on("room:closed", onRoomClosed);
-    socket.on("sync:state", (state: SyncStatePayload) => {
-      void applyRemoteState(state);
+    socket.on("playback:state", (state: PlaybackState) => {
+      void applyPlaybackStateToVideo(state);
     });
 
     if (socket.connected) onConnect();
@@ -176,13 +190,12 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       socket.off("room:info", onRoomInfo);
       socket.off("room:error", onRoomError);
       socket.off("room:closed", onRoomClosed);
-      socket.off("sync:state");
+      socket.off("playback:state");
     };
-  }, [applyRemoteState, code, socket]);
+  }, [applyPlaybackStateToVideo, code, socket]);
 
   useEffect(() => {
-    // Light drift correction to keep both sides aligned.
-    // Skip while user is scrubbing or when we don't have a loaded media element.
+    // Periodic drift correction from authoritative server state.
     const id = setInterval(() => {
       if (!socket.connected) return;
       const video = videoRef.current;
@@ -190,15 +203,15 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       if (video.readyState < 1) return;
       if (isUserSeekingRef.current) return;
 
-      socket.emit("sync:request", { code }, (state: SyncStatePayload) => {
-        // Apply only if we're noticeably off.
-        const diff = Math.abs(video.currentTime - state.currentTime);
-        if (diff > 1.0) void applyRemoteState({ ...state, action: "state" });
+      socket.emit("playback:request", { code }, (state: PlaybackState) => {
+        const target = computeTargetTimeSeconds(state);
+        const diff = Math.abs(target - video.currentTime);
+        if (diff > 1.0) void applyPlaybackStateToVideo(state);
       });
-    }, 10000);
+    }, 12000);
 
     return () => clearInterval(id);
-  }, [applyRemoteState, code, socket]);
+  }, [applyPlaybackStateToVideo, code, computeTargetTimeSeconds, socket]);
 
   useEffect(() => {
     return () => {
@@ -206,27 +219,21 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     };
   }, [videoUrl]);
 
-  const canControl = !closed && !error;
-
-  // Attach native media event listeners so we can use the real DOM event's isTrusted.
+  // Attach native media event listeners; emit ONLY on direct user actions.
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
     const onPlay = (ev: Event) => {
-      if (!canControl) return;
-      if (shouldSuppressLocalEmit()) return;
-      if (!ev.isTrusted) return;
-
-      socket.emit("sync:action", { code, action: "play", time: video.currentTime });
+      if (!shouldEmitUserEvent(ev)) return;
+      pendingStateRef.current = null;
+      socket.emit("playback:action", { code, type: "play", timeSeconds: video.currentTime });
     };
 
     const onPause = (ev: Event) => {
-      if (!canControl) return;
-      if (shouldSuppressLocalEmit()) return;
-      if (!ev.isTrusted) return;
-
-      socket.emit("sync:action", { code, action: "pause", time: video.currentTime });
+      if (!shouldEmitUserEvent(ev)) return;
+      pendingStateRef.current = null;
+      socket.emit("playback:action", { code, type: "pause", timeSeconds: video.currentTime });
     };
 
     const onSeeking = (ev: Event) => {
@@ -235,13 +242,15 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     };
 
     const onSeeked = (ev: Event) => {
-      if (!canControl) return;
       if (!ev.isTrusted) return;
       isUserSeekingRef.current = false;
+      if (!shouldEmitUserEvent(ev)) {
+        applyPendingIfPossible();
+        return;
+      }
 
-      // Emit only once the seek completes.
-      socket.emit("sync:action", { code, action: "seek", time: video.currentTime });
-      // Apply any queued remote state after user finishes scrubbing.
+      pendingStateRef.current = null;
+      socket.emit("playback:action", { code, type: "seek", timeSeconds: video.currentTime });
       applyPendingIfPossible();
     };
 
@@ -256,7 +265,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       video.removeEventListener("seeking", onSeeking);
       video.removeEventListener("seeked", onSeeked);
     };
-  }, [applyPendingIfPossible, canControl, code, shouldSuppressLocalEmit, socket]);
+  }, [applyPendingIfPossible, code, shouldEmitUserEvent, socket]);
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900">
@@ -333,18 +342,18 @@ export default function RoomPage({ params }: { params: { code: string } }) {
                       className="mt-3 w-full rounded-xl bg-white px-4 py-2 text-sm font-semibold text-zinc-900 hover:bg-zinc-100"
                       onClick={async () => {
                         const video = videoRef.current;
-                        const desired = desiredPlayingStateRef.current;
+                        const desired = blockedAutoplayStateRef.current;
                         if (!video || !desired) return;
 
-                        // Seek first, then try play in the user gesture.
+                        // Perform the seek and play as part of the user gesture.
                         try {
-                          video.currentTime = desired.currentTime;
+                          video.currentTime = Math.max(0, computeTargetTimeSeconds(desired));
                         } catch {}
 
-                        const ok = await safePlay(video);
+                        const ok = await tryPlay(video);
                         if (ok) {
+                          blockedAutoplayStateRef.current = null;
                           setNeedsGesture(false);
-                          desiredPlayingStateRef.current = null;
                         }
                       }}
                     >

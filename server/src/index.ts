@@ -5,13 +5,20 @@ import { Server } from "socket.io";
 
 type RoomCode = string;
 
+type PlaybackActionType = "play" | "pause" | "seek";
+
+type PlaybackState = {
+  isPlaying: boolean;
+  positionSeconds: number;
+  updatedAtMs: number;
+  seq: number;
+};
+
 type Room = {
   code: RoomCode;
   hostSocketId: string;
   sockets: Set<string>;
-  isPlaying: boolean;
-  currentTime: number;
-  lastUpdated: number;
+  playback: PlaybackState;
 };
 
 const app = express();
@@ -60,25 +67,52 @@ function emitRoomInfo(code: RoomCode) {
   });
 }
 
-function getComputedRoomState(room: Room) {
-  const now = Date.now();
-  const elapsedSeconds = room.isPlaying ? (now - room.lastUpdated) / 1000 : 0;
-  const currentTime = Math.max(0, room.currentTime + elapsedSeconds);
+function getPlaybackSnapshot(room: Room, nowMs: number) {
+  const elapsedSeconds = room.playback.isPlaying ? (nowMs - room.playback.updatedAtMs) / 1000 : 0;
+  const positionSeconds = Math.max(0, room.playback.positionSeconds + elapsedSeconds);
   return {
-    currentTime,
-    isPlaying: room.isPlaying,
+    isPlaying: room.playback.isPlaying,
+    positionSeconds,
+    seq: room.playback.seq,
+    serverTimeMs: nowMs,
   };
 }
 
-function emitSyncState(code: RoomCode, payload?: { by?: string; action?: "play" | "pause" | "seek" | "state" }) {
+function applyPlaybackAction(room: Room, nowMs: number, action: { type: PlaybackActionType; timeSeconds?: number }) {
+  // First, advance the room clock to "now" so our state is continuous.
+  const current = getPlaybackSnapshot(room, nowMs);
+  room.playback.positionSeconds = current.positionSeconds;
+  room.playback.updatedAtMs = nowMs;
+
+  const timeSeconds = Number.isFinite(action.timeSeconds) ? Math.max(0, action.timeSeconds as number) : undefined;
+
+  if (action.type === "seek") {
+    if (timeSeconds !== undefined) room.playback.positionSeconds = timeSeconds;
+  }
+
+  if (action.type === "play") {
+    if (timeSeconds !== undefined) room.playback.positionSeconds = timeSeconds;
+    room.playback.isPlaying = true;
+  }
+
+  if (action.type === "pause") {
+    if (timeSeconds !== undefined) room.playback.positionSeconds = timeSeconds;
+    room.playback.isPlaying = false;
+  }
+
+  room.playback.seq += 1;
+}
+
+function emitPlaybackState(code: RoomCode, payload: { by: string; action: PlaybackActionType | "state" }) {
   const room = rooms.get(code);
   if (!room) return;
 
-  const state = getComputedRoomState(room);
-  io.to(code).emit("sync:state", {
-    ...state,
-    ...payload,
-    serverTime: Date.now(),
+  const nowMs = Date.now();
+  const snapshot = getPlaybackSnapshot(room, nowMs);
+  io.to(code).emit("playback:state", {
+    ...snapshot,
+    by: payload.by,
+    action: payload.action,
   });
 }
 
@@ -91,9 +125,12 @@ io.on("connection", (socket) => {
       code,
       hostSocketId: socket.id,
       sockets: new Set([socket.id]),
-      isPlaying: false,
-      currentTime: 0,
-      lastUpdated: Date.now(),
+      playback: {
+        isPlaying: false,
+        positionSeconds: 0,
+        updatedAtMs: Date.now(),
+        seq: 0,
+      },
     };
 
     rooms.set(code, room);
@@ -117,70 +154,56 @@ io.on("connection", (socket) => {
     room.sockets.add(socket.id);
     socket.join(room.code);
 
-    // Send current room state snapshot to the new user.
-    socket.emit("sync:state", {
-      ...getComputedRoomState(room),
+    // Send current playback snapshot to the new user (late join + reconnect).
+    socket.emit("playback:state", {
+      ...getPlaybackSnapshot(room, Date.now()),
+      by: socket.id,
       action: "state",
-      serverTime: Date.now(),
     });
 
     socket.emit("room:joined", { code: room.code });
     emitRoomInfo(room.code);
   });
 
-  // PLAY / PAUSE / SEEK (ANY USER)
+  // PLAYBACK ACTION (ANY USER)
   socket.on(
-    "sync:action",
-    ({
-      code,
-      action,
-      time,
-    }: {
-      code: string;
-      action: "play" | "pause" | "seek";
-      time: number;
-    }) => {
+    "playback:action",
+    ({ code, type, timeSeconds }: { code: string; type: PlaybackActionType; timeSeconds?: number }) => {
       const normalized = code.trim().toUpperCase();
       const room = rooms.get(normalized);
       if (!room) return;
 
-      const now = Date.now();
+      // Only accept actions from sockets that are in the room.
+      if (!room.sockets.has(socket.id)) return;
 
-      room.currentTime = Number.isFinite(time) ? Math.max(0, time) : room.currentTime;
-      room.lastUpdated = now;
-
-      if (action === "play") room.isPlaying = true;
-      if (action === "pause") room.isPlaying = false;
-
-      // For seek, we keep current isPlaying and just move the clock.
-
-      // Broadcast authoritative state to everyone (including sender) so all clients converge.
-      emitSyncState(room.code, { by: socket.id, action });
+      const nowMs = Date.now();
+      applyPlaybackAction(room, nowMs, { type, timeSeconds });
+      emitPlaybackState(room.code, { by: socket.id, action: type });
     }
   );
 
-  // STATE REQUEST (ANY USER)
+  // PLAYBACK STATE REQUEST (ANY USER)
   socket.on(
-    "sync:request",
+    "playback:request",
     (
       { code }: { code: string },
-      cb?: (state: { currentTime: number; isPlaying: boolean; action?: "state"; serverTime?: number }) => void
+      cb?: (state: { isPlaying: boolean; positionSeconds: number; seq: number; serverTimeMs: number }) => void
     ) => {
       const normalized = code.trim().toUpperCase();
       const room = rooms.get(normalized);
       if (!room) return;
 
-      const state = getComputedRoomState(room);
+      const snapshot = getPlaybackSnapshot(room, Date.now());
       if (cb) {
-        cb({
-          ...state,
-          action: "state",
-          serverTime: Date.now(),
-        });
+        cb(snapshot);
         return;
       }
 
-      socket.emit("sync:state", state);
+      socket.emit("playback:state", {
+        ...snapshot,
+        by: socket.id,
+        action: "state",
+      });
     }
   );
 
