@@ -5,11 +5,20 @@ import { Server } from "socket.io";
 
 type RoomCode = string;
 
-type PlaybackActionType = "play" | "pause" | "seek";
+type PlaybackActionType = "play" | "pause" | "seek" | "rate";
+
+type ClientReport = {
+  timeSeconds: number;
+  isPlaying: boolean;
+  playbackRate: number;
+  receivedAtMs: number;
+  lastCorrectedAtMs: number;
+};
 
 type PlaybackState = {
   isPlaying: boolean;
   positionSeconds: number;
+  playbackRate: number;
   updatedAtMs: number;
   seq: number;
 };
@@ -19,6 +28,7 @@ type Room = {
   hostSocketId: string;
   sockets: Set<string>;
   playback: PlaybackState;
+  reports: Map<string, ClientReport>;
 };
 
 const app = express();
@@ -38,6 +48,11 @@ const io = new Server(server, {
 });
 
 const rooms = new Map<RoomCode, Room>();
+
+const SYNC_TOLERANCE_SECONDS = 0.25;
+const HARD_SEEK_THRESHOLD_SECONDS = 2.0;
+const REPORT_STALE_MS = 4000;
+const CORRECT_COOLDOWN_MS = 800;
 
 function randomRoomCode(): RoomCode {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -68,11 +83,14 @@ function emitRoomInfo(code: RoomCode) {
 }
 
 function getPlaybackSnapshot(room: Room, nowMs: number) {
-  const elapsedSeconds = room.playback.isPlaying ? (nowMs - room.playback.updatedAtMs) / 1000 : 0;
+  const elapsedSeconds = room.playback.isPlaying
+    ? ((nowMs - room.playback.updatedAtMs) / 1000) * room.playback.playbackRate
+    : 0;
   const positionSeconds = Math.max(0, room.playback.positionSeconds + elapsedSeconds);
   return {
     isPlaying: room.playback.isPlaying,
     positionSeconds,
+    playbackRate: room.playback.playbackRate,
     seq: room.playback.seq,
     serverTimeMs: nowMs,
   };
@@ -88,6 +106,13 @@ function applyPlaybackAction(room: Room, nowMs: number, action: { type: Playback
 
   if (action.type === "seek") {
     if (timeSeconds !== undefined) room.playback.positionSeconds = timeSeconds;
+  }
+
+  if (action.type === "rate") {
+    // Uses timeSeconds to carry the desired playbackRate.
+    if (timeSeconds !== undefined) {
+      room.playback.playbackRate = Math.min(2, Math.max(0.5, timeSeconds));
+    }
   }
 
   if (action.type === "play") {
@@ -116,6 +141,46 @@ function emitPlaybackState(code: RoomCode, payload: { by: string; action: Playba
   });
 }
 
+function computeClientPositionAtNow(report: ClientReport, nowMs: number) {
+  const ageSeconds = Math.max(0, (nowMs - report.receivedAtMs) / 1000);
+  const adv = report.isPlaying ? ageSeconds * report.playbackRate : 0;
+  return Math.max(0, report.timeSeconds + adv);
+}
+
+function getRoomSyncStatus(room: Room, nowMs: number) {
+  const snapshot = getPlaybackSnapshot(room, nowMs);
+
+  let worstAbsDriftSeconds = 0;
+  let allHaveFreshReports = true;
+  const drifts: Array<{ socketId: string; driftSeconds: number; abs: number }> = [];
+
+  for (const socketId of room.sockets) {
+    const report = room.reports.get(socketId);
+    if (!report || nowMs - report.receivedAtMs > REPORT_STALE_MS) {
+      allHaveFreshReports = false;
+      continue;
+    }
+
+    const clientPos = computeClientPositionAtNow(report, nowMs);
+    const driftSeconds = clientPos - snapshot.positionSeconds;
+    const abs = Math.abs(driftSeconds);
+    worstAbsDriftSeconds = Math.max(worstAbsDriftSeconds, abs);
+    drifts.push({ socketId, driftSeconds, abs });
+  }
+
+  const isSynced = allHaveFreshReports && drifts.every((d) => d.abs <= SYNC_TOLERANCE_SECONDS);
+  return { snapshot, isSynced, worstAbsDriftSeconds, allHaveFreshReports, drifts };
+}
+
+function emitRoomSyncIndicator(code: RoomCode, payload: { isSynced: boolean; worstAbsDriftSeconds: number }) {
+  io.to(code).emit("room:sync", {
+    isSynced: payload.isSynced,
+    worstAbsDriftSeconds: payload.worstAbsDriftSeconds,
+    toleranceSeconds: SYNC_TOLERANCE_SECONDS,
+    serverTimeMs: Date.now(),
+  });
+}
+
 io.on("connection", (socket) => {
   // CREATE ROOM
   socket.on("room:create", (cb?: (payload: { code: string }) => void) => {
@@ -128,9 +193,11 @@ io.on("connection", (socket) => {
       playback: {
         isPlaying: false,
         positionSeconds: 0,
+        playbackRate: 1,
         updatedAtMs: Date.now(),
         seq: 0,
       },
+      reports: new Map(),
     };
 
     rooms.set(code, room);
@@ -187,7 +254,7 @@ io.on("connection", (socket) => {
     "playback:request",
     (
       { code }: { code: string },
-      cb?: (state: { isPlaying: boolean; positionSeconds: number; seq: number; serverTimeMs: number }) => void
+      cb?: (state: { isPlaying: boolean; positionSeconds: number; playbackRate: number; seq: number; serverTimeMs: number }) => void
     ) => {
       const normalized = code.trim().toUpperCase();
       const room = rooms.get(normalized);
@@ -207,12 +274,43 @@ io.on("connection", (socket) => {
     }
   );
 
+  // CLIENT REPORT (PERIODIC) - enables server-side verification.
+  socket.on(
+    "playback:report",
+    ({
+      code,
+      timeSeconds,
+      isPlaying,
+      playbackRate,
+    }: {
+      code: string;
+      timeSeconds: number;
+      isPlaying: boolean;
+      playbackRate: number;
+    }) => {
+      const normalized = code.trim().toUpperCase();
+      const room = rooms.get(normalized);
+      if (!room) return;
+      if (!room.sockets.has(socket.id)) return;
+
+      const nowMs = Date.now();
+      room.reports.set(socket.id, {
+        timeSeconds: Number.isFinite(timeSeconds) ? Math.max(0, timeSeconds) : 0,
+        isPlaying: !!isPlaying,
+        playbackRate: Number.isFinite(playbackRate) ? Math.min(2, Math.max(0.5, playbackRate)) : 1,
+        receivedAtMs: nowMs,
+        lastCorrectedAtMs: room.reports.get(socket.id)?.lastCorrectedAtMs ?? 0,
+      });
+    }
+  );
+
   // DISCONNECT
   socket.on("disconnect", () => {
     for (const [code, room] of rooms) {
       if (!room.sockets.has(socket.id)) continue;
 
       room.sockets.delete(socket.id);
+      room.reports.delete(socket.id);
 
       if (room.hostSocketId === socket.id) {
         const nextHost = room.sockets.values().next().value as string | undefined;
@@ -234,6 +332,49 @@ io.on("connection", (socket) => {
     }
   });
 });
+
+// Periodic verification + sync indicator + targeted corrections.
+setInterval(() => {
+  const nowMs = Date.now();
+
+  for (const [code, room] of rooms) {
+    const { snapshot, isSynced, worstAbsDriftSeconds, drifts, allHaveFreshReports } = getRoomSyncStatus(room, nowMs);
+
+    // Server-driven indicator: green only when everyone is within tolerance.
+    emitRoomSyncIndicator(code, { isSynced, worstAbsDriftSeconds });
+
+    // If we don't have all reports, don't try to correct aggressively.
+    if (!allHaveFreshReports) continue;
+
+    for (const drift of drifts) {
+      const report = room.reports.get(drift.socketId);
+      if (!report) continue;
+
+      // Also correct mismatched play/pause/rate even if time is close.
+      const stateMismatch = report.isPlaying !== snapshot.isPlaying || Math.abs(report.playbackRate - snapshot.playbackRate) > 0.001;
+      const needsCorrection = drift.abs > SYNC_TOLERANCE_SECONDS || stateMismatch;
+      if (!needsCorrection) continue;
+
+      if (nowMs - report.lastCorrectedAtMs < CORRECT_COOLDOWN_MS) continue;
+
+      report.lastCorrectedAtMs = nowMs;
+      room.reports.set(drift.socketId, report);
+
+      const mode = drift.abs >= HARD_SEEK_THRESHOLD_SECONDS ? "hard" : "soft";
+
+      io.to(drift.socketId).emit("playback:correct", {
+        code,
+        targetTimeSeconds: snapshot.positionSeconds,
+        isPlaying: snapshot.isPlaying,
+        playbackRate: snapshot.playbackRate,
+        seq: snapshot.seq,
+        serverTimeMs: snapshot.serverTimeMs,
+        mode,
+        toleranceSeconds: SYNC_TOLERANCE_SECONDS,
+      });
+    }
+  }
+}, 500);
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
 server.listen(PORT, () => {

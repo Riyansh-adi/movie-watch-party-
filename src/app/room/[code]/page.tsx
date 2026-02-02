@@ -15,10 +15,29 @@ type PlaybackActionType = "play" | "pause" | "seek";
 type PlaybackState = {
   isPlaying: boolean;
   positionSeconds: number;
+  playbackRate: number;
   seq: number;
   serverTimeMs: number;
   by?: string;
-  action?: PlaybackActionType | "state";
+  action?: PlaybackActionType | "state" | "rate";
+};
+
+type SyncIndicatorPayload = {
+  isSynced: boolean;
+  worstAbsDriftSeconds: number;
+  toleranceSeconds: number;
+  serverTimeMs: number;
+};
+
+type CorrectionPayload = {
+  code: string;
+  targetTimeSeconds: number;
+  isPlaying: boolean;
+  playbackRate: number;
+  seq: number;
+  serverTimeMs: number;
+  mode: "soft" | "hard";
+  toleranceSeconds: number;
 };
 
 async function tryPlay(video: HTMLVideoElement) {
@@ -43,6 +62,8 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   const pendingStateRef = useRef<PlaybackState | null>(null);
   const lastSeqAppliedRef = useRef<number>(-1);
   const blockedAutoplayStateRef = useRef<PlaybackState | null>(null);
+  const basePlaybackRateRef = useRef(1);
+  const correctionTimeoutRef = useRef<number | null>(null);
 
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
@@ -54,6 +75,13 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   const [closed, setClosed] = useState(false);
   const [copied, setCopied] = useState(false);
   const [needsGesture, setNeedsGesture] = useState(false);
+  const [playbackRateUi, setPlaybackRateUi] = useState(1);
+  const [syncIndicator, setSyncIndicator] = useState<SyncIndicatorPayload>({
+    isSynced: false,
+    worstAbsDriftSeconds: 999,
+    toleranceSeconds: 0.25,
+    serverTimeMs: Date.now(),
+  });
 
   const isHost = !!selfId && !!hostId && selfId === hostId;
 
@@ -72,7 +100,14 @@ export default function RoomPage({ params }: { params: { code: string } }) {
   const computeTargetTimeSeconds = useCallback((state: PlaybackState) => {
     const nowMs = Date.now();
     const ageSeconds = Math.max(0, (nowMs - state.serverTimeMs) / 1000);
-    return state.isPlaying ? state.positionSeconds + ageSeconds : state.positionSeconds;
+    return state.isPlaying ? state.positionSeconds + ageSeconds * state.playbackRate : state.positionSeconds;
+  }, []);
+
+  const clearCorrectionTimer = useCallback(() => {
+    if (correctionTimeoutRef.current) {
+      window.clearTimeout(correctionTimeoutRef.current);
+      correctionTimeoutRef.current = null;
+    }
   }, []);
 
   const applyPlaybackStateToVideo = useCallback(async (state: PlaybackState) => {
@@ -94,6 +129,13 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     }
 
     const targetTimeSeconds = computeTargetTimeSeconds(state);
+
+    // Authoritative base playback rate.
+    basePlaybackRateRef.current = state.playbackRate;
+    setPlaybackRateUi(state.playbackRate);
+    clearCorrectionTimer();
+    // Apply base rate immediately (corrections apply separately).
+    video.playbackRate = state.playbackRate;
 
     applyingRemoteRef.current = true;
 
@@ -134,7 +176,7 @@ export default function RoomPage({ params }: { params: { code: string } }) {
         applyingRemoteRef.current = false;
       }, 500);
     }
-  }, [computeTargetTimeSeconds, suppressLocalEmits]);
+  }, [clearCorrectionTimer, computeTargetTimeSeconds, suppressLocalEmits]);
 
   const applyPendingIfPossible = useCallback(() => {
     const video = videoRef.current;
@@ -183,6 +225,110 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       void applyPlaybackStateToVideo(state);
     });
 
+    socket.on("room:sync", (payload: SyncIndicatorPayload) => {
+      setSyncIndicator(payload);
+    });
+
+    socket.on("playback:correct", async (payload: CorrectionPayload) => {
+      if (payload.code.trim().toUpperCase() !== code) return;
+
+      const video = videoRef.current;
+      if (!video) return;
+
+      // Treat correction as remote-controlled.
+      applyingRemoteRef.current = true;
+      suppressLocalEmits(900);
+
+      // Always converge to authoritative base rate.
+      basePlaybackRateRef.current = payload.playbackRate;
+      setPlaybackRateUi(payload.playbackRate);
+
+      const target = computeTargetTimeSeconds({
+        isPlaying: payload.isPlaying,
+        positionSeconds: payload.targetTimeSeconds,
+        playbackRate: payload.playbackRate,
+        seq: payload.seq,
+        serverTimeMs: payload.serverTimeMs,
+      });
+
+      const diff = target - video.currentTime;
+      const abs = Math.abs(diff);
+
+      clearCorrectionTimer();
+
+      if (payload.mode === "hard" || abs >= 2.0) {
+        try {
+          video.currentTime = Math.max(0, target);
+        } catch {}
+        video.playbackRate = payload.playbackRate;
+
+        if (payload.isPlaying) {
+          if (video.paused && !video.ended) {
+            const ok = await tryPlay(video);
+            if (!ok) {
+              blockedAutoplayStateRef.current = {
+                isPlaying: payload.isPlaying,
+                positionSeconds: payload.targetTimeSeconds,
+                playbackRate: payload.playbackRate,
+                seq: payload.seq,
+                serverTimeMs: payload.serverTimeMs,
+              };
+              setNeedsGesture(true);
+            }
+          }
+        } else {
+          if (!video.paused) video.pause();
+        }
+      } else {
+        // Soft correction: nudge playbackRate temporarily to close drift smoothly.
+        // For large-ish drifts, do a tiny partial seek to avoid long catch-up times.
+        if (abs > 0.75) {
+          const partial = Math.max(-0.5, Math.min(0.5, diff * 0.5));
+          try {
+            video.currentTime = Math.max(0, video.currentTime + partial);
+          } catch {}
+        }
+
+        const base = payload.playbackRate;
+        // Drift-based nudge, capped so it stays subtle.
+        const nudge = Math.max(-0.35, Math.min(0.35, diff * 0.25));
+        const nudged = Math.max(0.5, Math.min(2.0, base + nudge));
+        video.playbackRate = nudged;
+
+        correctionTimeoutRef.current = window.setTimeout(() => {
+          const v = videoRef.current;
+          if (!v) return;
+          v.playbackRate = basePlaybackRateRef.current;
+          applyingRemoteRef.current = false;
+          correctionTimeoutRef.current = null;
+        }, 1200);
+
+        // Ensure play/pause matches.
+        if (payload.isPlaying) {
+          if (video.paused && !video.ended) {
+            const ok = await tryPlay(video);
+            if (!ok) {
+              blockedAutoplayStateRef.current = {
+                isPlaying: payload.isPlaying,
+                positionSeconds: payload.targetTimeSeconds,
+                playbackRate: payload.playbackRate,
+                seq: payload.seq,
+                serverTimeMs: payload.serverTimeMs,
+              };
+              setNeedsGesture(true);
+            }
+          }
+        } else {
+          if (!video.paused) video.pause();
+        }
+      }
+
+      // Release remote suppression shortly after correction.
+      setTimeout(() => {
+        applyingRemoteRef.current = false;
+      }, 400);
+    });
+
     if (socket.connected) onConnect();
 
     return () => {
@@ -191,8 +337,10 @@ export default function RoomPage({ params }: { params: { code: string } }) {
       socket.off("room:error", onRoomError);
       socket.off("room:closed", onRoomClosed);
       socket.off("playback:state");
+      socket.off("room:sync");
+      socket.off("playback:correct");
     };
-  }, [applyPlaybackStateToVideo, code, socket]);
+  }, [applyPlaybackStateToVideo, clearCorrectionTimer, code, computeTargetTimeSeconds, socket, suppressLocalEmits]);
 
   useEffect(() => {
     // Periodic drift correction from authoritative server state.
@@ -213,11 +361,31 @@ export default function RoomPage({ params }: { params: { code: string } }) {
     return () => clearInterval(id);
   }, [applyPlaybackStateToVideo, code, computeTargetTimeSeconds, socket]);
 
+  // Client report loop (enables server-side verification + sync indicator).
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!socket.connected) return;
+      const video = videoRef.current;
+      if (!video) return;
+      if (video.readyState < 1) return;
+
+      socket.emit("playback:report", {
+        code,
+        timeSeconds: video.currentTime,
+        isPlaying: !video.paused && !video.ended,
+        playbackRate: video.playbackRate,
+      });
+    }, 500);
+
+    return () => clearInterval(id);
+  }, [code, socket]);
+
   useEffect(() => {
     return () => {
       if (videoUrl) URL.revokeObjectURL(videoUrl);
+      clearCorrectionTimer();
     };
-  }, [videoUrl]);
+  }, [clearCorrectionTimer, videoUrl]);
 
   // Attach native media event listeners; emit ONLY on direct user actions.
   useEffect(() => {
@@ -269,6 +437,16 @@ export default function RoomPage({ params }: { params: { code: string } }) {
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900">
+      <div
+        className="fixed right-4 top-4 z-50 h-3 w-3 rounded-full border border-white/60 shadow"
+        style={{ backgroundColor: syncIndicator.isSynced ? "#22c55e" : "#ef4444" }}
+        title={
+          syncIndicator.isSynced
+            ? "Synced"
+            : `Desynced (worst drift ${syncIndicator.worstAbsDriftSeconds.toFixed(2)}s, tol ${syncIndicator.toleranceSeconds}s)`
+        }
+      />
+
       <div className="mx-auto w-full max-w-5xl px-4 py-6">
         <div className="flex flex-col gap-4 rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -368,6 +546,53 @@ export default function RoomPage({ params }: { params: { code: string } }) {
               <div className="text-sm font-semibold text-zinc-900">Local video</div>
               <div className="text-sm text-zinc-600">
                 Both people must pick the same file from their own computer. The file is never uploaded.
+              </div>
+
+              <div className="mt-2 rounded-xl border border-zinc-200 bg-zinc-50 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-xs font-semibold text-zinc-700">Playback speed</div>
+                  <div className="text-xs font-semibold text-zinc-900">{playbackRateUi.toFixed(2)}x</div>
+                </div>
+                <input
+                  className="mt-2 w-full"
+                  type="range"
+                  min={0.5}
+                  max={2}
+                  step={0.25}
+                  value={playbackRateUi}
+                  onChange={(e) => {
+                    const next = Math.min(2, Math.max(0.5, Number(e.target.value)));
+                    setPlaybackRateUi(next);
+
+                    const video = videoRef.current;
+                    if (!video) return;
+
+                    // Direct user action → apply locally and notify server.
+                    basePlaybackRateRef.current = next;
+                    video.playbackRate = next;
+                    socket.emit("playback:action", { code, type: "rate", timeSeconds: next });
+                  }}
+                />
+                <div className="mt-2 flex justify-between text-[10px] text-zinc-500">
+                  <span>0.5x</span>
+                  <span>1x</span>
+                  <span>2x</span>
+                </div>
+
+                <button
+                  className="mt-3 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm font-semibold hover:bg-zinc-50"
+                  onClick={() => {
+                    const video = videoRef.current;
+                    if (!video) return;
+                    // Restart is a seek to 0; allow anyone.
+                    try {
+                      video.currentTime = 0;
+                    } catch {}
+                    socket.emit("playback:action", { code, type: "seek", timeSeconds: 0 });
+                  }}
+                >
+                  Restart
+                </button>
               </div>
 
               <label className="block">
