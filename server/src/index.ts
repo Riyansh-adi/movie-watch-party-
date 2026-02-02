@@ -72,7 +72,7 @@ function getComputedRoomState(room: Room) {
 
 io.on("connection", (socket) => {
   // CREATE ROOM
-  socket.on("room:create", () => {
+  socket.on("room:create", (cb?: (payload: { code: string }) => void) => {
     const code = createUniqueRoomCode();
 
     const room: Room = {
@@ -87,6 +87,7 @@ io.on("connection", (socket) => {
     rooms.set(code, room);
     socket.join(code);
 
+    if (cb) cb({ code });
     socket.emit("room:created", { code });
     emitRoomInfo(code);
   });

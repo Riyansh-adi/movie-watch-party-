@@ -7,8 +7,11 @@ export function getSocket(): Socket {
 
   const url = process.env.NEXT_PUBLIC_SOCKET_URL ?? "http://localhost:4000";
   socket = io(url, {
-    transports: ["websocket"],
+    // Allow fallback to HTTP long-polling when websockets are blocked.
+    transports: ["websocket", "polling"],
     autoConnect: true,
+    timeout: 8000,
+    reconnectionAttempts: 10,
   });
 
   return socket;

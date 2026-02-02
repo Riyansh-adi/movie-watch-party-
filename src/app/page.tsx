@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { getSocket } from "@/lib/socket";
 
@@ -10,14 +10,30 @@ export default function Home() {
   const [joinCode, setJoinCode] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const createTimeoutRef = useRef<number | null>(null);
+  const createConnectHandlerRef = useRef<(() => void) | null>(null);
+
+  const clearCreatePending = () => {
+    if (createTimeoutRef.current) {
+      window.clearTimeout(createTimeoutRef.current);
+      createTimeoutRef.current = null;
+    }
+
+    if (createConnectHandlerRef.current) {
+      socket.off("connect", createConnectHandlerRef.current);
+      createConnectHandlerRef.current = null;
+    }
+  };
 
   useEffect(() => {
     function onCreated(payload: { code: string }) {
+      clearCreatePending();
       setCreating(false);
       router.push(`/room/${payload.code}`);
     }
 
     function onRoomError(payload: { message: string }) {
+      clearCreatePending();
       setCreating(false);
       setError(payload.message);
     }
@@ -25,9 +41,19 @@ export default function Home() {
     socket.on("room:created", onCreated);
     socket.on("room:error", onRoomError);
 
+    function onConnectError(err: unknown) {
+      const message = err instanceof Error ? err.message : "Unable to connect to server";
+      clearCreatePending();
+      setCreating(false);
+      setError(message);
+    }
+
+    socket.on("connect_error", onConnectError);
+
     return () => {
       socket.off("room:created", onCreated);
       socket.off("room:error", onRoomError);
+      socket.off("connect_error", onConnectError);
     };
   }, [router, socket]);
 
@@ -53,7 +79,40 @@ export default function Home() {
               onClick={() => {
                 setError(null);
                 setCreating(true);
-                socket.emit("room:create");
+
+                // Avoid getting stuck if the server isn't reachable.
+                clearCreatePending();
+
+                createTimeoutRef.current = window.setTimeout(() => {
+                  clearCreatePending();
+                  setCreating(false);
+                  setError(
+                    "Create room timed out. Make sure the Socket.IO server is running (default http://localhost:4000)."
+                  );
+                }, 8000);
+
+                const emitCreate = () => {
+                  socket.emit("room:create", (payload?: { code?: string }) => {
+                    if (payload?.code) {
+                      clearCreatePending();
+                      setCreating(false);
+                      router.push(`/room/${payload.code}`);
+                      return;
+                    }
+                    // Fallback: server may emit room:created instead of ack.
+                  });
+                };
+
+                if (!socket.connected) {
+                  // Ensure we connect first; the emit will then succeed immediately.
+                  socket.connect();
+                  const onConnect = () => emitCreate();
+                  createConnectHandlerRef.current = onConnect;
+                  socket.on("connect", onConnect);
+                  return;
+                }
+
+                emitCreate();
               }}
             >
               {creating ? "Creating…" : "Create room"}
